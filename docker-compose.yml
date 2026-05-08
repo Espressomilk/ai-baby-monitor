@@ -7,21 +7,24 @@ services:
       - app-network
 
   vllm:
-    image: vllm/vllm-openai:v0.8.4
+    image: vllm/vllm-openai:v0.20.1
     command: >
       --model ${LLM_MODEL_NAME}
       --host 0.0.0.0
       --port ${VLLM_PORT}
       --enable-prefix-caching
       --quantization awq_marlin
-      --limit-mm-per-prompt image=5,video=5
+      --gpu-memory-utilization 0.85
+      --enforce-eager
+      --max-model-len 32768
+      --limit-mm-per-prompt '{"image":1,"video":1}'
     ports:
       - "${VLLM_PORT}:${VLLM_PORT}"
-    environment:
-      - VLLM_USE_V1=1
-      # - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+    # environment:
+    #   - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
+      - ~/.cache/vllm:/root/.cache/vllm
     deploy:
       resources:
         reservations:
@@ -35,6 +38,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+      start_period: 600s
     ipc: host
     restart: unless-stopped
     networks:
@@ -46,6 +50,10 @@ services:
       dockerfile: Dockerfile.python
     env_file:
       - .env
+    environment:
+      # Override host-only values from .env so containers use docker network DNS
+      REDIS_HOST: redis
+      VLLM_HOST: vllm
     depends_on:
       redis:
         condition: service_started
@@ -64,7 +72,7 @@ services:
       service: python-base
     command: >
       sh -c "
-      uv run python scripts/stream_to_redis.py --config-file configs/living_room.yaml
+      uv run python scripts/stream_to_redis.py --config-file configs/bedroom.yaml
       "
 
   streamlit_viewer:
@@ -72,7 +80,7 @@ services:
       service: python-base
     command: >
       sh -c "
-      uv run streamlit run scripts/streamlit_viewer.py --server.port 8501 --server.address 0.0.0.0 -- --config-files configs/living_room.yaml
+      uv run streamlit run scripts/streamlit_viewer.py --server.port 8501 --server.address 0.0.0.0 -- --config-files configs/bedroom.yaml
       "
     ports:
       - "8501:8501"

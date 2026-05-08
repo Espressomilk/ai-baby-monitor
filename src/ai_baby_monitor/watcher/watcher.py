@@ -142,15 +142,22 @@ class Watcher:
                 max_tokens=512,
                 extra_body={
                     "mm_processor_kwargs": {
-                        "fps": fps or [self._calculate_fps(frames)]
+                        "fps": fps if fps is not None else self._calculate_fps(frames)
                     },
                     "guided_json": self.json_schema,
                 },
             )
             
-            parsed_response = WatcherResponse.model_validate_json(
-                response.choices[0].message.content
-            )
+            raw_content = response.choices[0].message.content
+            json_text = raw_content.strip()
+            # Strip optional markdown fences like ```json ... ``` or bare "json\n"
+            if json_text.startswith("```"):
+                json_text = json_text.split("\n", 1)[1] if "\n" in json_text else json_text[3:]
+                if json_text.endswith("```"):
+                    json_text = json_text[:-3]
+            elif json_text.lower().startswith("json"):
+                json_text = json_text[4:].lstrip()
+            parsed_response = WatcherResponse.model_validate_json(json_text)
 
             return {
                 "success": True,

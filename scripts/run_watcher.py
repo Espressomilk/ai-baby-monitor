@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 import time
 from pathlib import Path
@@ -116,7 +117,10 @@ def run_watcher(
                 redis_handler.add_logs(logs_key, log_data)
 
                 if result["should_alert"]:
-                    playsound("assets/alert.wav")
+                    try:
+                        playsound("assets/alert.wav")
+                    except Exception as e:
+                        logger.warning("Could not play alert sound", error=str(e))
             else:
                 error_msg = result.get("error", "Unknown error")
                 logger.error("Error processing frames", error=error_msg)
@@ -144,11 +148,21 @@ def parse_args():
     parser.add_argument(
         "--config-file", required=True, help="Path to room configuration YAML file"
     )
+    parser.add_argument(
+        "-q", "--quiet", action="store_true",
+        help="Only show alerts and errors (suppress INFO/WARNING)",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+
+    structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(
+            logging.ERROR if args.quiet else logging.INFO
+        ),
+    )
 
     try:
         # Load room configuration from file

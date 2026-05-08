@@ -175,3 +175,10 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Claude Code session state
+.claude/
+
+# Watcher runtime
+.watcher.pid
+.watcher.log

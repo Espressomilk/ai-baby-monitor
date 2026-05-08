@@ -84,16 +84,16 @@ def fetch_logs(
 def render_logs(logs: list[dict]):
     
     for log in reversed(logs):
-        timestamp = log["timestamp"]
-        alert_status = "🚨" if log["should_alert"] == "1" else "🟢"
-        awareness_level = log["awareness_level"]
+        timestamp = log.get("timestamp", "?")
+        alert_status = "🚨" if log.get("should_alert") == "1" else "🟢"
+        awareness_level = log.get("recommended_awareness_level") or log.get("awareness_level", "LOW")
         if awareness_level == "LOW":
             awareness_level = f":green[{awareness_level}]"
         elif awareness_level == "MEDIUM":
             awareness_level = f":yellow[{awareness_level}]"
         else:
             awareness_level = f":red[{awareness_level}]"
-        reasoning = log["reasoning"]
+        reasoning = log.get("reasoning") or log.get("error", "")
         with st.chat_message("ai"):
             st.write(f"Timestamp: {timestamp}")
             st.write(f"Alert status: {alert_status}")
