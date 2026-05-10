@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Manages the docker stack (redis, vllm, streamlit_viewer, stream_to_redis)
-# plus the host-side watcher process.
+# Manages the docker stack only (redis, vllm, streamlit_viewer, stream_to_redis).
+# The host-side watcher is managed by scripts/start_watcher.sh -- this script
+# never invokes uv directly, but `status` and `stop` will surface / clean up
+# a detached watcher (.watcher.pid) if one is running.
 #
 # Usage:
-#   ./scripts/service.sh start [config]     # default config: bedroom
-#   ./scripts/service.sh stop
-#   ./scripts/service.sh restart [config]
-#   ./scripts/service.sh status
-#   ./scripts/service.sh logs [service]     # default: all docker services; "watcher" tails the host watcher
+#   ./scripts/service.sh start
+#   ./scripts/service.sh stop                # docker down; also kills detached watcher if any
+#   ./scripts/service.sh restart
+#   ./scripts/service.sh status              # docker services + watcher state + GPU
+#   ./scripts/service.sh logs [service]      # default: all docker services;
+#                                            #   "watcher" tails .watcher.log
+#
+# To start the watcher, use:
+#   ./scripts/start_watcher.sh --help
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# Watcher pidfile/log live here so we can read them for status/stop/logs.
+# They are written by scripts/start_watcher.sh, not by this script.
 PIDFILE="$PROJECT_ROOT/.watcher.pid"
 LOGFILE="$PROJECT_ROOT/.watcher.log"
-DEFAULT_CONFIG="bedroom"
 
 _watcher_pid() {
   [[ -f "$PIDFILE" ]] || return 1
@@ -30,10 +37,10 @@ _vllm_healthy() {
 }
 
 cmd_start() {
-  local config="${1:-$DEFAULT_CONFIG}"
-  local config_path="configs/${config}.yaml"
-  [[ -f "$config_path" ]] || { echo "Config not found: $config_path" >&2; exit 1; }
-
+  if (( $# )); then
+    echo "Note: 'start' takes no arguments now. To start the watcher, use ./scripts/start_watcher.sh"
+    echo "      Continuing with docker stack..."
+  fi
   echo "==> Bringing up docker stack..."
   docker compose up -d
 
@@ -50,28 +57,13 @@ cmd_start() {
       exit 1
     fi
   done
-  echo "==> vLLM is healthy."
-
-  if _watcher_pid >/dev/null; then
-    echo "==> Watcher already running (pid $(_watcher_pid))"
-  else
-    echo "==> Starting watcher with config: $config_path"
-    nohup uv run scripts/run_watcher.py --config-file "$config_path" -q \
-      >"$LOGFILE" 2>&1 &
-    echo $! > "$PIDFILE"
-    sleep 1
-    if _watcher_pid >/dev/null; then
-      echo "==> Watcher started (pid $(_watcher_pid)). Logs: $LOGFILE"
-    else
-      echo "Watcher failed to start. See $LOGFILE" >&2
-      rm -f "$PIDFILE"
-      exit 1
-    fi
-  fi
+  echo "==> vLLM is healthy. Stack is up."
+  echo "==> To start the watcher: ./scripts/start_watcher.sh --help"
 }
 
 cmd_stop() {
-  if local pid; pid=$(_watcher_pid); then
+  local pid
+  if pid=$(_watcher_pid 2>/dev/null) && [[ -n "$pid" ]]; then
     echo "==> Stopping watcher (pid $pid)"
     kill "$pid" || true
     sleep 1
@@ -88,7 +80,7 @@ cmd_stop() {
 
 cmd_restart() {
   cmd_stop
-  cmd_start "$@"
+  cmd_start
 }
 
 cmd_status() {
@@ -207,11 +199,12 @@ cmd_logs() {
 case "${1:-}" in
   start)   shift; cmd_start "$@" ;;
   stop)    cmd_stop ;;
-  restart) shift; cmd_restart "$@" ;;
+  restart) cmd_restart ;;
   status)  cmd_status ;;
   logs)    shift; cmd_logs "$@" ;;
   *)
-    echo "Usage: $0 {start [config]|stop|restart [config]|status|logs [service|watcher]}" >&2
+    echo "Usage: $0 {start|stop|restart|status|logs [service|watcher]}" >&2
+    echo "       Watcher is managed separately via ./scripts/start_watcher.sh" >&2
     exit 1
     ;;
 esac
