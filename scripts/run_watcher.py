@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -71,9 +72,13 @@ def play_alert(sound_path: str) -> None:
         ps = shutil.which("powershell.exe") or "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
         cmd = [
             ps, "-NoProfile", "-Command",
-            f'$p = New-Object Media.SoundPlayer "{win_path}"; $p.PlaySync()',
+            f'$p = New-Object Media.SoundPlayer "{win_path}"; $p.PlaySync() | Out-Null',
         ]
-        subprocess.run(cmd, check=True, timeout=10)
+        subprocess.run(
+            cmd, check=True, timeout=10,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         return
     # Non-WSL Linux / macOS / Windows-native: use playsound3.
     with _suppress_stderr():
@@ -194,6 +199,161 @@ class MotionGate:
         return False, max_diff
 
 
+class AudioGate:
+    """Audio loudness monitor that consumes per-window RMS values produced
+    by the streamer (stream_to_redis.py with --audio) from a Redis stream.
+
+    Sharing one ffmpeg/RTSP connection through the streamer (rather than
+    opening a second one from the watcher) avoids starving the camera's
+    client slots, which on the Synology shared stream caused both audio
+    and video to break.
+
+    `threshold_rms` is the int16-RMS value above which a window counts as
+    loud. Tune by watching the values in the watcher logs at rest vs
+    during a real cry.
+    """
+
+    def __init__(
+        self,
+        redis_handler,
+        room_key: str,
+        threshold_rms: float = 800.0,
+        cooldown_s: float = 8.0,
+        sustained_windows: int = 2,
+        max_age_s: float = 5.0,
+    ):
+        self.redis_handler = redis_handler
+        self.audio_key = f"{room_key}:audio_rms"
+        self.threshold_rms = threshold_rms
+        self.cooldown_s = cooldown_s
+        # Require N consecutive loud windows to trigger -- avoids one-off
+        # claps/door-slams from looking like a sustained cry.
+        self.sustained_windows = max(1, sustained_windows)
+        # If the most recent audio sample in Redis is older than this,
+        # treat audio as unavailable (streamer might be stuck reconnecting).
+        self.max_age_s = max_age_s
+
+        self._last_event_ts: float = 0.0
+        self._last_rms: float = 0.0
+        self._consecutive_loud: int = 0
+        self._last_seen_id: str | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._fresh_loud_event = False  # latched, consumed by main loop
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        last_periodic_log = time.time()
+        peak_since_log = 0.0
+        windows_seen = 0
+        first_logged = False
+        no_data_warned_at: float | None = None
+        while not self._stop.is_set():
+            try:
+                # Pull any new entries since last poll. xrevrange is fine;
+                # we sort + iterate in chronological order via [::-1].
+                entries = self.redis_handler.get_latest_entries(
+                    self.audio_key,
+                    count=20,
+                    last_id=self._last_seen_id,
+                )
+            except Exception as e:
+                logger.warning("AudioGate redis read error", error=str(e))
+                self._stop.wait(1.0)
+                continue
+
+            if not entries:
+                # Nothing new -- check if the stream has gone stale.
+                if no_data_warned_at is None or (time.time() - no_data_warned_at) > 30:
+                    if windows_seen == 0:
+                        logger.info(
+                            "AudioGate waiting for data",
+                            audio_key=self.audio_key,
+                        )
+                    no_data_warned_at = time.time()
+                self._stop.wait(0.25)
+                continue
+
+            no_data_warned_at = None
+            for entry_id, fields in entries:
+                eid = (
+                    entry_id.decode() if isinstance(entry_id, bytes) else entry_id
+                )
+                # Skip the entry that matches our last-seen id (xrevrange's
+                # min bound is inclusive, so we'd see it again every poll).
+                if eid == self._last_seen_id:
+                    continue
+                self._last_seen_id = eid
+                rms_raw = fields.get(b"rms") or fields.get("rms")
+                ts_raw = fields.get(b"timestamp") or fields.get("timestamp")
+                if rms_raw is None:
+                    continue
+                try:
+                    rms = float(rms_raw)
+                except Exception:
+                    continue
+                # Drop ancient entries -- if streamer was paused, don't
+                # let stale loudness from minutes ago re-fire an alert.
+                if ts_raw is not None:
+                    try:
+                        ts = float(ts_raw)
+                        if (time.time() - ts) > self.max_age_s:
+                            continue
+                    except Exception:
+                        pass
+                self._last_rms = rms
+                peak_since_log = max(peak_since_log, rms)
+                windows_seen += 1
+                if not first_logged:
+                    logger.info("AudioGate first window", rms=round(rms, 1))
+                    first_logged = True
+                if rms >= self.threshold_rms:
+                    self._consecutive_loud += 1
+                    if self._consecutive_loud >= self.sustained_windows:
+                        self._last_event_ts = time.time()
+                        self._fresh_loud_event = True
+                    elif self._consecutive_loud == 1:
+                        # Note transient spikes so users can see them go by
+                        # without flipping the alert.
+                        logger.info(
+                            "🔊 loud spike (not yet sustained)",
+                            rms=round(rms, 1),
+                            need=self.sustained_windows,
+                        )
+                else:
+                    self._consecutive_loud = 0
+
+            now = time.time()
+            if now - last_periodic_log >= 5.0:
+                logger.info(
+                    "AudioGate heartbeat",
+                    windows=windows_seen,
+                    peak_rms_5s=round(peak_since_log, 1),
+                    current_rms=round(self._last_rms, 1),
+                )
+                last_periodic_log = now
+                peak_since_log = 0.0
+
+            self._stop.wait(0.1)
+
+    def is_active(self) -> tuple[bool, float]:
+        """True if currently within cooldown after a sustained loud event."""
+        active = (time.time() - self._last_event_ts) <= self.cooldown_s
+        return active, self._last_rms
+
+    def consume_event(self) -> bool:
+        """Returns True exactly once per fresh sustained-loud event."""
+        if self._fresh_loud_event:
+            self._fresh_loud_event = False
+            return True
+        return False
+
+
 def run_watcher(
     redis_stream_key: str,
     redis_host: str,
@@ -207,6 +367,10 @@ def run_watcher(
     motion_cooldown_s: float,
     idle_sleep_s: float,
     motion_ignore_regions: list[tuple[float, float, float, float]] | None = None,
+    enable_audio: bool = False,
+    audio_threshold_rms: float = 800.0,
+    audio_cooldown_s: float = 8.0,
+    audio_sustained_windows: int = 2,
 ):
     """
     Run the Watcher continuously to monitor frames from Redis stream.
@@ -261,6 +425,24 @@ def run_watcher(
         ignore_regions=motion_ignore_regions,
     )
 
+    audio_gate: AudioGate | None = None
+    if enable_audio:
+        audio_gate = AudioGate(
+            redis_handler=redis_handler,
+            room_key=redis_stream_key,
+            threshold_rms=audio_threshold_rms,
+            cooldown_s=audio_cooldown_s,
+            sustained_windows=audio_sustained_windows,
+        )
+        audio_gate.start()
+        logger.info(
+            "Audio gating enabled (consuming from streamer's audio_rms stream)",
+            audio_key=f"{redis_stream_key}:audio_rms",
+            threshold_rms=audio_threshold_rms,
+            cooldown_s=audio_cooldown_s,
+            sustained_windows=audio_sustained_windows,
+        )
+
     # Warm up vLLM with a single real request so the first motion event
     # doesn't pay the cold-start kernel-compile tax (often 30-180s).
     logger.info("Warming up vLLM (one inference call)...")
@@ -297,46 +479,82 @@ def run_watcher(
             )
 
             if not frames:
-                logger.warning(
-                    "No frames available in stream", video_queue_key=subsampled_key
-                )
+                logger.warning("· no frames in stream", queue=subsampled_key)
                 time.sleep(0.3)
                 continue
 
-            should_run, motion_score = motion_gate.update(frames)
+            motion_run, motion_score = motion_gate.update(frames)
+            audio_run, audio_rms = (False, 0.0)
+            audio_event = False
+            if audio_gate is not None:
+                audio_run, audio_rms = audio_gate.is_active()
+                audio_event = audio_gate.consume_event()
+                # A *fresh* sustained loud event also fires the alert sound
+                # immediately, regardless of what VLM concludes.
+                if audio_event:
+                    logger.info(
+                        "🔔 audio alert: sustained loud noise",
+                        rms=round(audio_rms, 1),
+                    )
+                    redis_handler.add_logs(
+                        logs_key,
+                        {
+                            "timestamp": time.time(),
+                            "should_alert": 1,
+                            "awareness_level": "HIGH",
+                            "reasoning": (
+                                f"Audio: sustained loud noise "
+                                f"(RMS={round(audio_rms, 1)} >= {audio_threshold_rms})."
+                            ),
+                        },
+                    )
+                    try:
+                        play_alert("assets/alert.wav")
+                    except Exception as e:
+                        logger.warning(
+                            "Could not play alert sound", error=str(e)
+                        )
+
+            should_run = motion_run or audio_run
             if not should_run:
-                logger.info(
-                    "Skipping LLM call: no motion",
-                    motion_score=round(motion_score, 2),
-                    threshold=motion_threshold,
-                )
+                gate_log = {"motion": round(motion_score, 2)}
+                if audio_gate is not None:
+                    gate_log["audio"] = round(audio_rms, 1)
+                logger.info("· idle", **gate_log)
                 time.sleep(idle_sleep_s)
                 continue
 
-            logger.info(
-                "Analyzing frames from stream",
-                num_frames=len(frames),
-                motion_score=round(motion_score, 2),
+            trigger = (
+                "audio" if (audio_run and not motion_run)
+                else "audio+motion" if (audio_run and motion_run)
+                else "motion"
             )
+            gate_log = {
+                "trigger": trigger,
+                "motion": round(motion_score, 2),
+                "frames": len(frames),
+            }
+            if audio_gate is not None:
+                gate_log["audio"] = round(audio_rms, 1)
+            logger.info("→ analyzing frames", **gate_log)
 
             # Process frames with Watcher
             result = nanny_watcher.process_frames(frames)
 
             if result["success"]:
-                # Log the result
-                alert_status = (
-                    "🚨 ALERT TRIGGERED"
-                    if result["should_alert"]
-                    else "✅ No alert needed"
-                )
                 awareness = result["recommended_awareness_level"]
-
-                logger.info(
-                    "Alert status and reasoning",
-                    alert_status=alert_status,
-                    awareness_level=awareness,
-                    reasoning=result["reasoning"],
-                )
+                if result["should_alert"]:
+                    logger.info(
+                        "🚨 ALERT",
+                        level=awareness,
+                        reason=result["reasoning"],
+                    )
+                else:
+                    logger.info(
+                        "✓ ok",
+                        level=awareness,
+                        reason=result["reasoning"],
+                    )
 
                 # Stream logs back to Redis
                 log_data = {
@@ -369,6 +587,9 @@ def run_watcher(
         logger.info("Watcher stopped by user")
     except Exception as e:
         logger.error("Error in Watcher", error=e)
+    finally:
+        if audio_gate is not None:
+            audio_gate.stop()
 
 
 def parse_args():
@@ -411,13 +632,48 @@ def parse_args():
             "timestamp: --motion-ignore 0.7,0,1,0.1"
         ),
     )
+    parser.add_argument(
+        "--audio", action="store_true",
+        help=(
+            "Enable audio gating: pull audio from the camera RTSP stream "
+            "via ffmpeg, trigger VLM analysis (and a direct alert) on "
+            "sustained loud noise."
+        ),
+    )
+    parser.add_argument(
+        "--audio-threshold", type=float, default=800.0,
+        help="Int16-RMS loudness threshold per 0.25s window. Default: 800",
+    )
+    parser.add_argument(
+        "--audio-cooldown", type=float, default=8.0,
+        help="Keep VLM analysis active this many seconds after the last loud "
+             "audio event. Default: 8.0",
+    )
+    parser.add_argument(
+        "--audio-sustained-windows", type=int, default=2,
+        help="How many consecutive loud 0.25s windows count as a real event "
+             "(filters out one-off claps/door-slams). Default: 2",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
+    # Pretty console output: short timestamp, colored level, padded event
+    # message, key=value tail. Falls back to plain output if not a TTY.
+    is_tty = sys.stderr.isatty()
     structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="%H:%M:%S", utc=False),
+            structlog.dev.ConsoleRenderer(
+                colors=is_tty,
+                pad_event=32,
+                sort_keys=True,
+            ),
+        ],
         wrapper_class=structlog.make_filtering_bound_logger(
             logging.ERROR if args.quiet else logging.INFO
         ),
@@ -474,6 +730,10 @@ if __name__ == "__main__":
             motion_cooldown_s=args.motion_cooldown,
             idle_sleep_s=args.idle_sleep,
             motion_ignore_regions=ignore_regions or None,
+            enable_audio=args.audio,
+            audio_threshold_rms=args.audio_threshold,
+            audio_cooldown_s=args.audio_cooldown,
+            audio_sustained_windows=args.audio_sustained_windows,
         )
     except FileNotFoundError:
         logger.error(f"Configuration file not found: {args.config_file}")

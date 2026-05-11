@@ -22,6 +22,11 @@ IDLE_SLEEP=1.0
 # a top-right camera-overlay timestamp: --motion-ignore 0.75,0,1.0,0.10).
 MOTION_IGNORE_DEFAULT=()
 MOTION_IGNORE=()
+# Audio gating
+AUDIO=0
+AUDIO_THRESHOLD=800
+AUDIO_COOLDOWN=8.0
+AUDIO_SUSTAINED=2
 EXTRA_ARGS=()
 # -----------------------------------------------------------------------------
 
@@ -47,6 +52,22 @@ Watcher tuning:
                                [0,1] coords). Repeat for multiple regions.
                                No regions are masked by default.
                                E.g. top-right timestamp: --motion-ignore 0.75,0,1,0.1
+
+Audio gating (off by default; consumes RMS values pushed to Redis by the
+streamer when it is run with --audio):
+  --audio                      Enable audio gating. Triggers VLM analysis AND
+                               an immediate alert sound on sustained loud noise
+                               (cry, scream, etc.). Requires the streamer
+                               container to be running with --audio so the
+                               <room>:audio_rms Redis stream is populated.
+  --audio-threshold INT        Int16-RMS loudness threshold per 0.25s window.
+                               Default: 800. Tune by watching audio_rms in
+                               logs while quiet vs during a real cry.
+  --audio-cooldown FLOAT       Seconds to keep VLM analysis active after the
+                               last loud event. Default: 8.0
+  --audio-sustained N          How many consecutive loud 0.25s windows count
+                               as a real event (filters claps/door-slams).
+                               Default: 2 (= 0.5s of sustained loudness)
 
 Runtime:
   -q, --quiet                  Suppress INFO/WARNING logs (errors + alerts only).
@@ -86,6 +107,13 @@ while (( $# )); do
     --idle-sleep=*)         IDLE_SLEEP="${1#*=}" ;;
     --motion-ignore)        MOTION_IGNORE+=("$2"); shift ;;
     --motion-ignore=*)      MOTION_IGNORE+=("${1#*=}") ;;
+    --audio)                AUDIO=1 ;;
+    --audio-threshold)      AUDIO_THRESHOLD="$2"; shift ;;
+    --audio-threshold=*)    AUDIO_THRESHOLD="${1#*=}" ;;
+    --audio-cooldown)       AUDIO_COOLDOWN="$2"; shift ;;
+    --audio-cooldown=*)     AUDIO_COOLDOWN="${1#*=}" ;;
+    --audio-sustained)      AUDIO_SUSTAINED="$2"; shift ;;
+    --audio-sustained=*)    AUDIO_SUSTAINED="${1#*=}" ;;
     --)                     shift; EXTRA_ARGS+=("$@"); break ;;
     -*)                     echo "Unknown flag: $1 (try --help)" >&2; exit 1 ;;
     *)                      CONFIG="$1" ;;
@@ -112,6 +140,14 @@ else
   for region in "${regions_to_use[@]}"; do
     [[ -n "$region" ]] && UV_ARGS+=(--motion-ignore "$region")
   done
+fi
+if (( AUDIO )); then
+  UV_ARGS+=(
+    --audio
+    --audio-threshold "$AUDIO_THRESHOLD"
+    --audio-cooldown  "$AUDIO_COOLDOWN"
+    --audio-sustained-windows "$AUDIO_SUSTAINED"
+  )
 fi
 # Detached mode is always quiet unless explicitly disabled (we don't expose
 # --no-quiet, but `--` extra args could re-add INFO logging if the user wants).

@@ -43,6 +43,11 @@ class CameraStream:
             try:
                 capture = cv2.VideoCapture(uri)
                 if capture.isOpened():
+                    # Keep only the most recent frame buffered. Without
+                    # this, cv2 buffers several seconds of frames and
+                    # delivers them in bursts -- visible as "frozen then
+                    # jumps a few seconds" in the viewer.
+                    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     logger.info("Successfully connected to RTSP stream", uri=uri)
                     return capture
                 raise ConnectionError("Failed to open RTSP stream")
@@ -76,12 +81,9 @@ class CameraStream:
 
     def capture_new_frame(self) -> Frame | None:
         """Capture a new frame from the camera, only when available. Encode into jpeg."""
-        # Check if a new frame is available
         if not self.capture.grab():
             logger.warning("No frame available to grab")
             return None
-
-        # Retrieve the grabbed frame
         ret, frame = self.capture.retrieve()
         if not ret:
             logger.warning("Failed to retrieve grabbed frame")
