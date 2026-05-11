@@ -1,8 +1,10 @@
 import argparse
+import io
 import os
 
 import streamlit as st
 import structlog
+from PIL import Image
 from dotenv import load_dotenv
 
 from ai_baby_monitor.config import load_multiple_room_configs
@@ -65,16 +67,39 @@ if selected_mode == "Real-time stream":
     stream_placeholder = st.empty()
     log_placeholder = st.empty()
 
-    while True:
-        with stream_placeholder.container():
-            image, timestamp = get_last_image_with_timestamp(
-                redis_handler, selected_config.name
-            )
-            if image:
-                st.image(image, use_container_width=True)
-                with st.expander("Frame Info"):
-                    st.caption(f"Timestamp: {timestamp}")
+    frame_key = f"{selected_config.name}:realtime"
+    last_frame_id = "$"  # only wait for *future* frames
 
+    # Render whatever is on the stream right now so the page isn't blank
+    # while we wait for the first new frame.
+    image, timestamp = get_last_image_with_timestamp(
+        redis_handler, selected_config.name
+    )
+    if image:
+        with stream_placeholder.container():
+            st.image(image, use_container_width=True)
+            with st.expander("Frame Info"):
+                st.caption(f"Timestamp: {timestamp}")
+
+    while True:
+        # Block on the Redis stream until a new frame is published, or
+        # 1s passes (so we still refresh logs even when the camera is
+        # silent). This keeps CPU near zero between frames instead of
+        # spinning at 116%.
+        result = redis_handler.wait_for_new_frame(
+            frame_key, last_id=last_frame_id, block_ms=1000
+        )
+        if result is not None:
+            last_frame_id, frame = result
+            if frame is not None:
+                jpeg_bytes = bytes(frame.frame_data)
+                image = Image.open(io.BytesIO(jpeg_bytes))
+                with stream_placeholder.container():
+                    st.image(image, use_container_width=True)
+                    with st.expander("Frame Info"):
+                        st.caption(f"Timestamp: {frame.timestamp}")
+
+        # Refresh logs on every loop iteration (cheap; just an xrevrange).
         with log_placeholder.container(height=350):
             with st.expander("LLM Logs", expanded=True, icon="🤖"):
                 logs = fetch_logs(
@@ -82,7 +107,6 @@ if selected_mode == "Real-time stream":
                     selected_config.name,
                     num_logs=1,
                 )
-
                 render_logs(logs)
 
 else:

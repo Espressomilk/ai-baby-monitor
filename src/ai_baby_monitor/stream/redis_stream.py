@@ -149,3 +149,41 @@ class RedisStreamHandler:
     ) -> list[dict]:
         """Get the latest logs from the Redis stream."""
         return self.get_latest_entries(key=key, count=count, last_id=last_log_id)
+
+    def wait_for_new_entry(
+        self,
+        key: str,
+        last_id: str = "$",
+        block_ms: int = 1000,
+    ) -> tuple[str, dict] | None:
+        """Block (server-side) until a new entry appears on `key`, then
+        return the *latest* one. Returns None on timeout.
+
+        Use this instead of a busy-poll loop when you want to render the
+        instant a new entry shows up but spin no CPU in between.
+
+        `last_id` should be the id you last consumed; pass "$" the first
+        time to wait only for *future* entries (not the current tail).
+        """
+        result = self.redis_client.xread({key: last_id}, count=1, block=block_ms)
+        if not result:
+            return None
+        # result shape: [(stream_key, [(entry_id, fields), ...])]
+        _, entries = result[0]
+        if not entries:
+            return None
+        # In case multiple arrived during the block, take the newest.
+        entry_id, fields = entries[-1]
+        if isinstance(entry_id, bytes):
+            entry_id = entry_id.decode()
+        return entry_id, fields
+
+    def wait_for_new_frame(
+        self, key: str, last_id: str = "$", block_ms: int = 1000
+    ) -> tuple[str, Frame | None] | None:
+        """Same as wait_for_new_entry but deserialized as a Frame."""
+        result = self.wait_for_new_entry(key, last_id=last_id, block_ms=block_ms)
+        if result is None:
+            return None
+        entry_id, fields = result
+        return entry_id, self.deserialize_frame(fields)
